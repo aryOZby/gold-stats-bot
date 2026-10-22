@@ -1,0 +1,1296 @@
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Callable, Optional
+
+from .brokers.base import Broker
+from .config import AppConfig, load_config
+from .db import Database
+from .emailer import EmailSender
+from .excel_report import ExcelReporter, month_bounds
+from .models import (
+    CloseReason,
+    GroupConfig,
+    ParsedSignal,
+    Side,
+    SignalRecord,
+    SignalStatus,
+    TradeRecord,
+    TradeStatus,
+)
+from .risk import daily_loss_reached, risk_lot, validate_signal
+from .stats import max_tp_hit
+from .timeutil import pips_from_prices, safety_levels, utcnow
+
+_LOG = logging.getLogger(__name__)
+
+AlertFn = Callable[[str, Optional[str]], None]
+
+
+@dataclass
+class IncomingSignal:
+    parsed: ParsedSignal
+    group: GroupConfig
+    chat_id: int
+    telegram_msg_id: int
+    received_at: datetime
+    raw_text: str
+
+
+class TradingEngine:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        db: Database,
+        broker: Broker,
+        reporter: ExcelReporter,
+        alert: Optional[AlertFn] = None,
+    ):
+        self.cfg = cfg
+        self.db = db
+        self.broker = broker
+        self.reporter = reporter
+        self.alert = alert or (lambda *_: None)
+        self._q: queue.Queue[IncomingSignal] = queue.Queue()
+        self._report_q: queue.Queue[tuple[str, datetime]] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._report_thread: Optional[threading.Thread] = None
+        self._safety_due: dict[str, float] = {}
+        self._be_done: set[str] = set()
+        self._guarded: set[int] = set()
+        self._cfg_mtime: Optional[float] = None
+        self._symbol_ok: Optional[bool] = None
+        self._chart_groups: Optional[dict[str, bool]] = None
+        self.mailer = EmailSender(cfg.email)
+
+    def start(self) -> None:
+        # טלגרם חייב לעלות גם אם MT5 עדיין לא מאושר. כשיגיע איתות
+        # ננסה להתחבר שוב ונפתח פוזיציה רק אם החשבון חי.
+        try:
+            self.broker.connect()
+            self._check_symbol()
+            self._recover()
+            self._apply_chart_groups()
+        except Exception:
+            _LOG.exception("Broker not ready at startup — Telegram listener will still start")
+            self.alert(
+                "הבוט מאזין לטלגרם, אבל MT5 לא מחובר. "
+                "כשיגיע איתות ייעשה ניסיון נוסף לפתוח פוזיציה. "
+                "ב-MT5: File > Login to Trade Account עד ש-Journal כותב authorized.",
+                None,
+            )
+        self._thread = threading.Thread(target=self._run, name="trading", daemon=True)
+        self._report_thread = threading.Thread(target=self._report_loop, name="excel", daemon=True)
+        self._thread.start()
+        self._report_thread.start()
+
+    def _ensure_broker(self) -> bool:
+        """מתחבר ל-MT5 אם עדיין לא מחוברים. dry_run/file_bridge תמיד מצליחים."""
+        if getattr(self.broker, "_connected", None) is True:
+            return True
+        try:
+            self.broker.connect()
+        except Exception:
+            _LOG.exception("Broker connect failed")
+            return False
+        if getattr(self.broker, "_connected", None) is False:
+            return False
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.broker.shutdown()
+
+    def submit(self, incoming: IncomingSignal) -> None:
+        self._q.put(incoming)
+
+    def _recover(self) -> None:
+        """התאוששות אחרי קריסה או ריסטארט: מיישר את ה-DB מול המצב אצל הברוקר.
+
+        שלושה מקרים: עסקאות שנסגרו בזמן שהבוט היה למטה, פוזיציות חיות שכבר
+        מוכרות, ופוזיציות חיות שלא הספיקו להיכתב ל-DB לפני הקריסה.
+        """
+        open_trades = self.db.open_trades()
+        known: set[int] = set()
+        for trade in open_trades:
+            self._safety_due.setdefault(trade.signal_id, time.monotonic() + 1)
+            if trade.sl_moved_to_be:
+                self._be_done.add(trade.signal_id)
+            if trade.ticket is not None:
+                known.add(int(trade.ticket))
+
+        try:
+            live_by_magic = self._positions_by_magic()
+        except Exception:
+            _LOG.exception("recovery: broker positions unavailable, keeping DB state as-is")
+            return
+
+        live_tickets = {pos.ticket for positions in live_by_magic.values() for pos in positions}
+
+        closed = 0
+        for trade in open_trades:
+            if trade.ticket is None or int(trade.ticket) in live_tickets:
+                continue
+            if self._finalize_closed(trade):
+                closed += 1
+
+        adopted = 0
+        for magic, positions in live_by_magic.items():
+            for pos in positions:
+                if int(pos.ticket) in known:
+                    continue
+                known.add(int(pos.ticket))
+                if self.db.trade_by_ticket(pos.ticket) is not None:
+                    continue
+                if self._adopt_position(pos, magic):
+                    adopted += 1
+
+        stale = self._clear_stale_active()
+        _LOG.info(
+            "Recovery: %s open in DB, %s closed while down, %s orphan positions adopted, %s stale signals cleared",
+            len(open_trades),
+            closed,
+            adopted,
+            len(stale),
+        )
+        if closed or adopted or stale:
+            self.alert(
+                f"התאוששות אחרי הפעלה מחדש: {closed} עסקאות נסגרו בזמן שהבוט היה למטה, "
+                f"{adopted} פוזיציות אומצו, {len(stale)} איתותים תקועים שוחררו.",
+                None,
+            )
+
+    def _clear_stale_active(self, group_name: Optional[str] = None) -> list[str]:
+        """איתות שנשאר active בלי פוזיציה פתוחה חוסם את הקבוצה לנצח — משחררים אותו."""
+        cleared: list[str] = []
+        for signal in self.db.active_signals():
+            if group_name and signal.group_name != group_name:
+                continue
+            open_legs = [
+                t for t in self.db.trades_for_signal(signal.id)
+                if t.status == TradeStatus.OPEN.value and t.ticket
+            ]
+            if open_legs:
+                continue
+            self.db.update_signal_status(
+                signal.id, SignalStatus.FAILED.value, skipped_reason="stale_active"
+            )
+            cleared.append(signal.id)
+            _LOG.warning(
+                "Cleared stale active signal %s (%s) — no open positions",
+                signal.id,
+                signal.group_name,
+            )
+        return cleared
+
+    def _adopt_position(self, pos, magic: int) -> bool:
+        """מאמץ פוזיציה חיה שאינה ב-DB כדי שתנוהל ותתועד כרגיל."""
+        group_name, tp_index = _parse_trade_comment(pos.comment)
+        if group_name is None:
+            group = self._group_for_magic(magic)
+            group_name = group.name if group else "recovered"
+        signal = next(
+            (s for s in self.db.active_signals() if s.group_name == group_name), None
+        )
+        signal_id = signal.id if signal else f"recovered-{pos.ticket}"
+        now = utcnow()
+        trade = TradeRecord(
+            id=None,
+            ticket=int(pos.ticket),
+            signal_id=signal_id,
+            group_name=group_name,
+            tp_index=tp_index or 0,
+            tp_price=float(pos.tp or 0.0),
+            lot=float(pos.volume),
+            side=pos.side.value,
+            symbol=pos.symbol,
+            received_at=signal.received_at if signal else now,
+            entry_time=now,
+            entry_price=float(pos.price_open),
+            sl=float(pos.sl or 0.0),
+            original_sl=float(pos.sl or 0.0),
+            sl_moved_to_be=False,
+            exit_time=None,
+            exit_price=None,
+            close_reason=None,
+            profit=None,
+            pips=None,
+            status=TradeStatus.OPEN.value,
+            zone_low=signal.zone_low if signal else 0.0,
+            zone_high=signal.zone_high if signal else 0.0,
+            telegram_chat_id=signal.chat_id if signal else 0,
+            telegram_username=signal.username if signal else "",
+        )
+        self.db.insert_trade(trade)
+        self._safety_due.setdefault(signal_id, time.monotonic() + 1)
+        _LOG.warning(
+            "Adopted orphan position ticket=%s group=%s tp_index=%s",
+            pos.ticket,
+            group_name,
+            tp_index,
+        )
+        self._queue_report(group_name, trade.received_at)
+        return True
+
+    def _finalize_closed(self, trade: TradeRecord) -> bool:
+        """סוגר רשומה ב-DB לפי העסקה בפועל אצל הברוקר."""
+        deal = self.broker.closed_deal(trade.ticket)
+        if deal is None:
+            return False
+        reason = deal.reason.value
+        if trade.sl_moved_to_be and deal.reason in {CloseReason.SL, CloseReason.UNKNOWN}:
+            if (
+                trade.entry_price is not None
+                and abs(deal.exit_price - trade.entry_price) <= self.cfg.pip_size
+            ):
+                reason = CloseReason.BREAKEVEN.value
+        trade.exit_time = deal.exit_time
+        trade.exit_price = deal.exit_price
+        trade.profit = deal.profit
+        trade.close_reason = reason
+        trade.status = TradeStatus.CLOSED.value
+        if trade.entry_price is not None:
+            trade.pips = pips_from_prices(
+                trade.side, trade.entry_price, deal.exit_price, self.cfg.pip_size
+            )
+        self.db.update_trade(trade)
+        _LOG.info("Closed ticket %s reason=%s profit=%s", trade.ticket, reason, deal.profit)
+        self._queue_report(trade.group_name, trade.received_at)
+        if reason == CloseReason.TP.value:
+            trigger = self._breakeven_trigger_trade(trade.signal_id)
+            if trigger is not None and trigger.tp_index == trade.tp_index:
+                self._move_stops_to_entry(trade.signal_id, after_tp_index=trade.tp_index)
+        return True
+
+    def _run(self) -> None:
+        last_sched = 0.0
+        last_guard = 0.0
+        while not self._stop.is_set():
+            try:
+                item = self._q.get(timeout=0.2)
+            except queue.Empty:
+                item = None
+            if item is not None:
+                try:
+                    self._handle(item)
+                except Exception:
+                    _LOG.exception("signal handling failed")
+                    self.alert("שגיאה בטיפול באיתות. ראה לוג.", None)
+            try:
+                self._monitor()
+                self._maybe_safety()
+            except Exception:
+                _LOG.exception("monitor failed")
+            now = time.monotonic()
+            if now - last_guard >= self.cfg.guard_interval_seconds:
+                last_guard = now
+                try:
+                    self._guard_positions()
+                except Exception:
+                    _LOG.exception("guard failed")
+                try:
+                    self._maybe_reload_settings()
+                    self._apply_chart_groups()
+                except Exception:
+                    _LOG.exception("config reload failed")
+                try:
+                    self._check_symbol()
+                except Exception:
+                    _LOG.exception("symbol check failed")
+            if now - last_sched >= 20:
+                last_sched = now
+                try:
+                    self._scheduler_tick()
+                except Exception:
+                    _LOG.exception("scheduler failed")
+
+    def _handle(self, item: IncomingSignal) -> None:
+        if self.db.already_processed(item.chat_id, item.telegram_msg_id):
+            _LOG.info("Duplicate telegram message ignored %s/%s", item.chat_id, item.telegram_msg_id)
+            return
+
+        self._apply_chart_groups()
+        signal_id = _signal_id(item)
+        chart = self._trade_symbol()
+        symbol = chart or item.parsed.symbol
+        received = item.received_at
+
+        if not self.cfg.trading_enabled:
+            reason = "trading_disabled"
+            rec = _new_signal(signal_id, item, symbol, SignalStatus.SKIPPED.value, reason)
+            self.db.insert_signal(rec)
+            self._queue_report(item.group.name, received)
+            _LOG.warning("Signal %s recorded but not executed (%s)", signal_id, reason)
+            return
+
+        self._clear_stale_active(item.group.name)
+        active = self.db.active_signals()
+        if any(s.group_name == item.group.name for s in active):
+            rec = _new_signal(signal_id, item, symbol, SignalStatus.SKIPPED.value, "busy_group")
+            self.db.insert_signal(rec)
+            self._queue_report(item.group.name, received)
+            _LOG.warning(
+                "Skipped signal %s — %s already has an active signal (won't mix BUY and SELL)",
+                signal_id,
+                item.group.name,
+            )
+            self.alert(
+                f"דולג איתות מ-{item.group.name}: כבר יש איתות פתוח באותה קבוצה "
+                "(לא פותחים לונג ושורט יחד).",
+                None,
+            )
+            return
+        limit = self.cfg.max_concurrent_signals
+        if limit > 0 and len(active) >= limit:
+            rec = _new_signal(signal_id, item, symbol, SignalStatus.SKIPPED.value, "busy_one_signal")
+            self.db.insert_signal(rec)
+            self._queue_report(item.group.name, received)
+            _LOG.warning("Skipped signal %s — another signal is active", signal_id)
+            self.alert(f"דולג איתות מ-{item.group.name}: כבר יש איתות פתוח.", None)
+            return
+
+        # שורות TP קרובות מדולגות. מבין מה שנשאר לוקחים רק את ה-TP הרחוקים.
+        # קידום לכניסה מחכה ל-TP שנפתח בפועל, לא לשורה שדולגה.
+        tradable = select_tradable_tps(
+            item.parsed,
+            skip_first=self._skip_first_tps(item.group),
+            take_farthest=self._take_farthest_tps(item.group),
+        )
+        if not tradable:
+            rec = _new_signal(signal_id, item, symbol, SignalStatus.SKIPPED.value, "no_tp_after_skip")
+            self.db.insert_signal(rec)
+            self._queue_report(item.group.name, received)
+            _LOG.warning(
+                "Signal %s has %s TP lines, none tradable after skip/farthest filter",
+                signal_id,
+                len(item.parsed.tps),
+            )
+            return
+
+        if not self._ensure_broker():
+            rec = _new_signal(signal_id, item, symbol, SignalStatus.FAILED.value, "mt5_not_connected")
+            self.db.insert_signal(rec)
+            self._queue_report(item.group.name, received)
+            _LOG.error("Signal %s recorded but MT5 is not connected", signal_id)
+            self.alert(
+                f"איתות מ-{item.group.name} נקלט, אבל MT5 לא מחובר — לא נפתחה פוזיציה. "
+                "File > Login to Trade Account עד ש-Journal כותב authorized.",
+                None,
+            )
+            return
+
+        chart = self._trade_symbol()
+        if not chart:
+            rec = _new_signal(signal_id, item, symbol, SignalStatus.SKIPPED.value, "no_gold_chart")
+            self.db.insert_signal(rec)
+            self._queue_report(item.group.name, received)
+            _LOG.error("Signal %s skipped — no open gold chart (telegram symbol ignored)", signal_id)
+            self.alert(
+                f"איתות מ-{item.group.name} נקלט, אבל אין גרף זהב פתוח ב-MT5 — לא נפתחה פוזיציה. "
+                "פתח גרף XAUUSD.c (או GOLD) והשאר אותו פתוח.",
+                None,
+            )
+            return
+        symbol = chart
+
+        risk = self.cfg.risk
+        market_price = self._safe_price(symbol) if (risk.sanity_checks or risk.uses_risk_percent) else None
+
+        if self._daily_loss_blocked(received):
+            self._skip_signal(
+                signal_id, item, symbol, "daily_loss_limit",
+                f"דולג איתות מ-{item.group.name}: הגעת למגבלת ההפסד היומית. "
+                "פוזיציות פתוחות לא נסגרו.",
+            )
+            return
+
+        if risk.sanity_checks:
+            problem = validate_signal(
+                item.parsed,
+                market_price=market_price,
+                max_sl_pips=risk.max_sl_pips,
+                pip_size=self.cfg.pip_size,
+            )
+            if problem:
+                self._skip_signal(
+                    signal_id, item, symbol, problem,
+                    f"איתות מ-{item.group.name} נדחה בבדיקת תקינות: {problem}",
+                )
+                return
+
+        if risk.uses_risk_percent:
+            lot = self._risk_lot(symbol, item.parsed, market_price, legs=len(tradable))
+            if lot is None:
+                self._skip_signal(
+                    signal_id, item, symbol, "risk_lot_unavailable",
+                    f"דולג איתות מ-{item.group.name}: לא ניתן לחשב לוט לפי אחוז סיכון "
+                    "(יתרה לא זמינה או שהלוט המינימלי חורג מהסיכון).",
+                )
+                return
+        else:
+            lot = self._order_lot(item.group)
+
+        rec = _new_signal(signal_id, item, symbol, SignalStatus.ACTIVE.value, "")
+        self.db.insert_signal(rec)
+
+        magic = item.group.magic or self.cfg.magic_number
+        _LOG.info(
+            "Signal %s %s %s SL=%s legs=%s lot=%s (%s)",
+            signal_id, item.parsed.side.value, symbol, item.parsed.sl,
+            [f"TP{i}@{p}" for i, p in tradable], lot, risk.lot_mode,
+        )
+        # --- EXECUTE FIRST, persist after each fill ---
+        any_ok = False
+        for index, tp_price in tradable:
+            comment = f"GS|{item.group.name[:8]}|T{index}"[:31]
+            result = None
+            attempts = self.cfg.order_retries + 1
+            for _ in range(attempts):
+                result = self.broker.market_order(
+                    symbol=symbol,
+                    side=item.parsed.side,
+                    volume=lot,
+                    sl=item.parsed.sl,
+                    tp=tp_price,
+                    comment=comment,
+                    deviation=self.cfg.deviation,
+                    magic=magic,
+                )
+                if result.ok:
+                    break
+            if result and result.ok:
+                any_ok = True
+                trade = TradeRecord(
+                    id=None,
+                    ticket=result.ticket,
+                    signal_id=signal_id,
+                    group_name=item.group.name,
+                    tp_index=index,
+                    tp_price=tp_price,
+                    # ה-EA יכול לדרוס את הלוט מהגרף, ולכן מתעדים את מה שבוצע.
+                    lot=result.filled_volume or lot,
+                    side=item.parsed.side.value,
+                    symbol=symbol,
+                    received_at=received,
+                    entry_time=result.fill_time,
+                    entry_price=result.fill_price,
+                    sl=result.sl if result.sl is not None else item.parsed.sl,
+                    original_sl=item.parsed.sl,
+                    sl_moved_to_be=False,
+                    exit_time=None,
+                    exit_price=None,
+                    close_reason=None,
+                    profit=None,
+                    pips=None,
+                    status=TradeStatus.OPEN.value,
+                    zone_low=item.parsed.zone_low,
+                    zone_high=item.parsed.zone_high,
+                    telegram_chat_id=item.chat_id,
+                    telegram_username=item.group.username,
+                )
+                self.db.insert_trade(trade)
+            else:
+                msg = result.message if result else "no result"
+                _LOG.error("Order failed TP%s: %s", index, msg)
+                failed = TradeRecord(
+                    id=None,
+                    ticket=None,
+                    signal_id=signal_id,
+                    group_name=item.group.name,
+                    tp_index=index,
+                    tp_price=tp_price,
+                    lot=lot,
+                    side=item.parsed.side.value,
+                    symbol=symbol,
+                    received_at=received,
+                    entry_time=None,
+                    entry_price=None,
+                    sl=item.parsed.sl,
+                    original_sl=item.parsed.sl,
+                    sl_moved_to_be=False,
+                    exit_time=None,
+                    exit_price=None,
+                    close_reason=None,
+                    profit=None,
+                    pips=None,
+                    status=TradeStatus.FAILED.value,
+                    zone_low=item.parsed.zone_low,
+                    zone_high=item.parsed.zone_high,
+                    telegram_chat_id=item.chat_id,
+                    telegram_username=item.group.username,
+                )
+                self.db.insert_trade(failed)
+
+        if not any_ok:
+            self.db.update_signal_status(signal_id, SignalStatus.FAILED.value, skipped_reason="all_orders_failed")
+            last_msg = result.message if result else "no result"
+            self.alert(f"כל הפקודות נכשלו לאיתות {signal_id}: {last_msg}", None)
+        else:
+            self._safety_due[signal_id] = time.monotonic() + self.cfg.safety_delay_seconds
+            _LOG.info(
+                "Executed signal %s: %s positions (TP%s..TP%s) of %s lines",
+                signal_id,
+                len(tradable),
+                tradable[0][0],
+                tradable[-1][0],
+                len(item.parsed.tps),
+            )
+
+        self._queue_report(item.group.name, received)
+
+    def _magics(self) -> set[int]:
+        magics = {self.cfg.magic_number}
+        for group in self.cfg.groups:
+            magics.add(group.magic or self.cfg.magic_number)
+        return magics
+
+    def _group_by_name(self, name: str) -> Optional[GroupConfig]:
+        return next((g for g in self.cfg.groups if g.name == name), None)
+
+    def _order_lot(self, group: GroupConfig) -> float:
+        from .config import STATS_LOT
+
+        return STATS_LOT
+
+    def _chart_file_dirs(self) -> list[str]:
+        extra: list[str] = []
+        getter = getattr(self.broker, "chart_files_dir", None)
+        if callable(getter):
+            folder = getter()
+            if folder:
+                extra.append(folder)
+        return extra
+
+    def _skip_signal(self, signal_id: str, item: IncomingSignal, symbol: str, reason: str, message: str) -> None:
+        rec = _new_signal(signal_id, item, symbol, SignalStatus.SKIPPED.value, reason)
+        self.db.insert_signal(rec)
+        self._queue_report(item.group.name, item.received_at)
+        _LOG.warning("Signal %s skipped: %s", signal_id, reason)
+        self.alert(message, None)
+
+    def _safe_price(self, symbol: str) -> Optional[float]:
+        try:
+            return self.broker.last_price(symbol)
+        except Exception:
+            _LOG.exception("last_price failed for %s", symbol)
+            return None
+
+    def _safe_balance(self) -> Optional[float]:
+        try:
+            return self.broker.account_balance()
+        except Exception:
+            _LOG.exception("account_balance failed")
+            return None
+
+    def _risk_lot(
+        self, symbol: str, parsed: ParsedSignal, market_price: Optional[float], legs: int
+    ) -> Optional[float]:
+        risk = self.cfg.risk
+        balance = self._safe_balance()
+        if not balance:
+            _LOG.error("risk_percent sizing needs the account balance, broker returned none")
+            return None
+        try:
+            value = self.broker.value_per_price_unit(symbol)
+        except Exception:
+            _LOG.exception("value_per_price_unit failed for %s", symbol)
+            value = None
+        entry = market_price or (parsed.zone_low + parsed.zone_high) / 2.0
+        lot = risk_lot(
+            balance=balance,
+            risk_percent=risk.risk_percent,
+            entry=entry,
+            sl=parsed.sl,
+            legs=legs,
+            value_per_price_unit=value or risk.contract_value,
+            min_lot=risk.min_lot,
+            max_lot=risk.max_lot,
+            lot_step=risk.lot_step,
+        )
+        _LOG.info(
+            "Risk sizing: balance=%.2f risk=%.2f%% entry=%s sl=%s legs=%s -> lot=%s",
+            balance, risk.risk_percent, entry, parsed.sl, legs, lot,
+        )
+        return lot
+
+    def _daily_loss_blocked(self, now: datetime) -> bool:
+        risk = self.cfg.risk
+        if risk.daily_loss_limit <= 0 and risk.daily_loss_limit_percent <= 0:
+            return False
+        local = now.astimezone(self.cfg.tz)
+        start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        pnl = self.db.realised_pnl_between(start, start + timedelta(days=1))
+        balance = self._safe_balance() if risk.daily_loss_limit_percent > 0 else None
+        blocked = daily_loss_reached(pnl, balance, risk.daily_loss_limit, risk.daily_loss_limit_percent)
+        if blocked:
+            _LOG.warning("Daily loss limit reached: realised P/L today %.2f", pnl)
+        return blocked
+
+    def _skip_first_tps(self, group: Optional[GroupConfig]) -> int:
+        if group is not None and group.skip_first_tps is not None:
+            return group.skip_first_tps
+        return self.cfg.skip_first_tps
+
+    def _take_farthest_tps(self, group: Optional[GroupConfig]) -> int:
+        if group is not None and group.take_farthest_tps is not None:
+            return group.take_farthest_tps
+        return self.cfg.take_farthest_tps
+
+    def _breakeven_after_tp(self, group_name: str) -> int:
+        group = self._group_by_name(group_name)
+        if group is not None and group.breakeven_after_tp is not None:
+            return group.breakeven_after_tp
+        return self.cfg.breakeven_after_tp
+
+    def _breakeven_trigger_trade(self, signal_id: str) -> Optional[TradeRecord]:
+        """ה-TP שצריך באמת להיגע לפני שמקדמים סטופים לכניסה.
+
+        אם שורת breakeven_after_tp דולגה (skip / farthest), מחכים ל-TP
+        הפתוח הקרוב ביותר שאחריה — אף פעם לא למחיר של שורה שלא נפתחה.
+        """
+        trades = [t for t in self.db.trades_for_signal(signal_id) if t.ticket is not None]
+        if not trades:
+            return None
+        trigger_n = self._breakeven_after_tp(trades[0].group_name)
+        chosen = select_breakeven_trigger(
+            [(t.tp_index, t.tp_price) for t in trades],
+            trigger_n,
+        )
+        if chosen is None:
+            return None
+        index, _price = chosen
+        return next((t for t in trades if t.tp_index == index), None)
+
+    def _group_for_magic(self, magic: int) -> Optional[GroupConfig]:
+        for group in self.cfg.groups:
+            if (group.magic or self.cfg.magic_number) == magic:
+                return group
+        return None
+
+    def _positions_by_magic(self) -> dict[int, list]:
+        return {magic: list(self.broker.positions(magic)) for magic in self._magics()}
+
+    def _live_positions(self) -> dict:
+        live = {}
+        for positions in self._positions_by_magic().values():
+            for pos in positions:
+                live[pos.ticket] = pos
+        return live
+
+    def _monitor(self) -> None:
+        open_trades = self.db.open_trades()
+        if not open_trades:
+            return
+        live = self._live_positions()
+        live_tickets = set(live)
+
+        for trade in open_trades:
+            if trade.ticket is None or trade.ticket in live_tickets:
+                continue
+            self._finalize_closed(trade)
+
+        self._maybe_breakeven_by_price(open_trades)
+        self._complete_if_done(open_trades)
+
+    def _maybe_breakeven_by_price(self, open_trades: list[TradeRecord]) -> None:
+        by_signal: dict[str, list[TradeRecord]] = {}
+        for trade in open_trades:
+            if trade.status != TradeStatus.OPEN.value:
+                continue
+            by_signal.setdefault(trade.signal_id, []).append(trade)
+        for signal_id, group in by_signal.items():
+            if signal_id in self._be_done:
+                continue
+            trigger_trade = self._breakeven_trigger_trade(signal_id)
+            if trigger_trade is None:
+                continue
+            if trigger_trade.close_reason == CloseReason.TP.value:
+                self._move_stops_to_entry(signal_id, after_tp_index=trigger_trade.tp_index)
+                continue
+            if trigger_trade.status != TradeStatus.OPEN.value:
+                continue
+            target = trigger_trade.tp_price
+            price = self.broker.last_price(group[0].symbol)
+            if price is None:
+                continue
+            touched = (
+                price >= target
+                if group[0].side == "BUY"
+                else price <= target
+            )
+            if touched:
+                self._move_stops_to_entry(signal_id, after_tp_index=trigger_trade.tp_index)
+
+    def _move_stops_to_entry(self, signal_id: str, after_tp_index: int) -> None:
+        if signal_id in self._be_done:
+            return
+        trades = [
+            t
+            for t in self.db.trades_for_signal(signal_id)
+            if t.status == TradeStatus.OPEN.value and t.tp_index > after_tp_index
+        ]
+        moved = 0
+        for trade in trades:
+            if trade.ticket is None or trade.entry_price is None:
+                continue
+            # רק SL לכניסה. ה-TP נשאר במחירו עד שנגיעים אליו באמת.
+            ok = self.broker.modify_sl_tp(trade.ticket, sl=trade.entry_price, tp=trade.tp_price)
+            if ok:
+                self.db.mark_breakeven(trade.id, trade.entry_price)
+                moved += 1
+            else:
+                _LOG.warning("Failed to move SL to entry ticket=%s", trade.ticket)
+        self._be_done.add(signal_id)
+        _LOG.info(
+            "Moved %s stops to entry for %s after TP%s was reached (farther legs only)",
+            moved,
+            signal_id,
+            after_tp_index,
+        )
+        report_from = trades or self.db.trades_for_signal(signal_id)
+        if report_from:
+            self._queue_report(report_from[0].group_name, report_from[0].received_at)
+
+    def _complete_if_done(self, snapshot: list[TradeRecord]) -> None:
+        signal_ids = {t.signal_id for t in snapshot}
+        for sid in set(t.signal_id for t in self.db.open_trades()) | signal_ids:
+            trades = self.db.trades_for_signal(sid)
+            if not trades:
+                continue
+            if any(t.status == TradeStatus.OPEN.value for t in trades):
+                continue
+            signal = self.db.get_signal(sid)
+            if signal is None or signal.status != SignalStatus.ACTIVE.value:
+                continue
+            level = max_tp_hit(trades)
+            self.db.update_signal_status(
+                sid,
+                SignalStatus.COMPLETED.value,
+                max_tp_hit=level,
+                completed_at=utcnow(),
+            )
+            self._safety_due.pop(sid, None)
+            _LOG.info("Signal %s completed max_tp=%s", sid, level)
+            self._queue_report(signal.group_name, signal.received_at)
+
+    def _maybe_safety(self) -> None:
+        due = [(sid, ts) for sid, ts in self._safety_due.items() if time.monotonic() >= ts]
+        for signal_id, _ in due:
+            self._apply_safety(signal_id)
+            self._safety_due.pop(signal_id, None)
+
+    def _apply_safety(self, signal_id: str) -> None:
+        live = self._live_positions()
+        trades = [t for t in self.db.trades_for_signal(signal_id) if t.status == TradeStatus.OPEN.value]
+        for trade in trades:
+            if trade.ticket is None or trade.ticket not in live:
+                continue
+            pos = live[trade.ticket]
+            missing_sl = pos.sl is None or pos.sl == 0
+            missing_tp = pos.tp is None or pos.tp == 0
+            if not missing_sl and not missing_tp:
+                continue
+            if trade.entry_price is None:
+                continue
+            sl_s, tp_s = safety_levels(
+                trade.side, trade.entry_price, self.cfg.safety_pips, self.cfg.pip_size
+            )
+            new_sl = sl_s if missing_sl else pos.sl
+            new_tp = tp_s if missing_tp else pos.tp
+            ok = self.broker.modify_sl_tp(trade.ticket, sl=new_sl, tp=new_tp)
+            if ok:
+                trade.sl = new_sl
+                trade.tp_price = new_tp if missing_tp else trade.tp_price
+                self.db.update_trade(trade)
+                _LOG.warning("Safety SL/TP applied ticket=%s sl=%s tp=%s", trade.ticket, new_sl, new_tp)
+                self.alert(f"מנגנון בטיחות הופעל על טיקט {trade.ticket}", None)
+            else:
+                _LOG.error("Safety modify failed ticket=%s", trade.ticket)
+
+    def _trade_symbol(self) -> str:
+        """סימול לפקודה: גרף הזהב הפתוח. הסימול מההודעה בטלגרם לא משמש למסחר."""
+        override = (self.cfg.symbol_override or "").strip()
+        if override:
+            return override
+        try:
+            chart = self.broker.chart_symbol()
+        except Exception:
+            _LOG.exception("chart_symbol failed")
+            chart = None
+        return chart or ""
+
+    def _check_symbol(self) -> None:
+        """הסימול תלוי בחשבון שמחובר בטרמינל, והוא עלול להתחלף תוך כדי ריצה.
+
+        מתריע רק כשהמצב משתנה, כדי לא להציף.
+        """
+        symbol = self._trade_symbol()
+        ok = bool(symbol) and self.broker.last_price(symbol) is not None
+        if ok == self._symbol_ok:
+            return
+        self._symbol_ok = ok
+        if ok:
+            _LOG.info("Symbol %s is available again", symbol)
+            self.alert(f"הסימול {symbol} חזר להיות זמין. המסחר יכול להימשך.", None)
+            return
+        _LOG.error("Gold chart is NOT available — orders will be skipped")
+        if not symbol:
+            self.alert(
+                "אין גרף זהב פתוח ב-MT5. כל איתות ידולג עד שייפתח גרף (XAUUSD.c).",
+                None,
+            )
+        else:
+            self.alert(
+                f"הסימול {symbol} לא זמין בחשבון שמחובר ב-MT5. כל פקודה תיכשל.\n"
+                f"פתח גרף זהב ב-MT5 (למשל XAUUSD.c).",
+                None,
+            )
+
+    def _maybe_reload_settings(self) -> None:
+        """טעינה חמה של הידיות הידניות מ-config.yaml, בלי להפעיל מחדש.
+
+        נטענים מחדש רק גודל הלוט, פרמטרי האסטרטגיה לכל קבוצה, והמתג הראשי.
+        שאר ההגדרות דורשות הפעלה מחדש בכוונה, כדי לא לשבור ריצה פעילה.
+        """
+        path = self.cfg.config_path
+        if path is None:
+            return
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            return
+        if self._cfg_mtime is None:
+            self._cfg_mtime = mtime
+            return
+        if mtime == self._cfg_mtime:
+            return
+        self._cfg_mtime = mtime
+
+        try:
+            fresh = load_config(Path(path))
+        except Exception:
+            _LOG.exception("config.yaml שונה אבל לא ניתן לטעינה — ממשיך עם הקודם")
+            self.alert("config.yaml שונה אבל יש בו שגיאה. הבוט ממשיך עם ההגדרות הישנות.", None)
+            return
+
+        changes: list[str] = []
+        by_name = {g.name: g for g in fresh.groups}
+        for group in self.cfg.groups:
+            new = by_name.get(group.name)
+            if new is None:
+                continue
+            group.lot = 0.01
+            group.enabled = True
+            for attr, label in (
+                ("skip_first_tps", "דילוג TP"),
+                ("take_farthest_tps", "TP רחוקים"),
+                ("breakeven_after_tp", "קידום אחרי TP"),
+            ):
+                old_value = getattr(group, attr)
+                new_value = getattr(new, attr)
+                if old_value != new_value:
+                    setattr(group, attr, new_value)
+                    changes.append(f"{group.name}: {label} {old_value} -> {new_value}")
+
+        if fresh.trading_enabled != self.cfg.trading_enabled:
+            self.cfg.trading_enabled = fresh.trading_enabled
+            state = "פעיל" if fresh.trading_enabled else "מושבת (מאזין ומתעד בלבד)"
+            changes.append(f"מסחר: {state}")
+
+        if fresh.max_concurrent_signals != self.cfg.max_concurrent_signals:
+            self.cfg.max_concurrent_signals = fresh.max_concurrent_signals
+            changes.append(f"איתותים במקביל: {fresh.max_concurrent_signals or 'ללא הגבלה'}")
+
+        if fresh.risk != self.cfg.risk:
+            self.cfg.risk = fresh.risk
+            changes.append(f"ניהול סיכונים: lot_mode={fresh.risk.lot_mode}")
+
+        if fresh.symbol_override != self.cfg.symbol_override:
+            old = self.cfg.symbol_override or "(גרף פתוח)"
+            self.cfg.symbol_override = fresh.symbol_override
+            new = self.cfg.symbol_override or "(גרף פתוח)"
+            changes.append(f"סימול: {old} -> {new}")
+
+        if changes:
+            _LOG.info("Config reloaded: %s", "; ".join(changes))
+            self.alert("עודכנו הגדרות:\n" + "\n".join(changes), None)
+        self._apply_chart_groups()
+
+    def _apply_chart_groups(self) -> None:
+        """Stats bot: every configured group stays on. Chart files cannot disable one."""
+        for group in self.cfg.groups:
+            group.enabled = True
+            group.lot = 0.01
+
+    def _guard_positions(self) -> None:
+        """שומר בלתי תלוי באסטרטגיה: אף פוזיציה חיה לא נשארת בלי SL ו-TP.
+
+        רץ על כל פוזיציה שנושאת magic שלנו, כולל כאלה שאינן ב-DB, ולא תלוי
+        בשום לוגיקת איתות. זו רשת הביטחון האחרונה.
+        """
+        for pos in self._live_positions().values():
+            missing_sl = not pos.sl
+            missing_tp = not pos.tp
+            if not missing_sl and not missing_tp:
+                self._guarded.discard(int(pos.ticket))
+                continue
+            trade = self.db.trade_by_ticket(pos.ticket)
+            fallback_sl, fallback_tp = safety_levels(
+                pos.side.value, pos.price_open, self.cfg.safety_pips, self.cfg.pip_size
+            )
+            # מעדיפים את הרמות המקוריות של האיתות, ונופלים ל-50 פיפס רק אם אין.
+            new_sl = pos.sl
+            new_tp = pos.tp
+            if missing_sl:
+                new_sl = (trade.sl if trade and trade.sl else 0.0) or fallback_sl
+            if missing_tp:
+                new_tp = (trade.tp_price if trade and trade.tp_price else 0.0) or fallback_tp
+
+            if not self.broker.modify_sl_tp(pos.ticket, sl=new_sl, tp=new_tp):
+                _LOG.error("Guard failed to set SL/TP on ticket=%s", pos.ticket)
+                continue
+            _LOG.warning(
+                "Guard set SL/TP ticket=%s sl=%s tp=%s (missing sl=%s tp=%s)",
+                pos.ticket,
+                new_sl,
+                new_tp,
+                missing_sl,
+                missing_tp,
+            )
+            if trade is not None:
+                trade.sl = new_sl
+                if missing_tp:
+                    trade.tp_price = new_tp
+                self.db.update_trade(trade)
+            if int(pos.ticket) not in self._guarded:
+                self._guarded.add(int(pos.ticket))
+                self.alert(f"מנגנון הגנה הוסיף SL/TP לפוזיציה {pos.ticket}", None)
+
+    def _queue_report(self, group_name: str, when: datetime) -> None:
+        self._report_q.put((group_name, when))
+
+    def _report_loop(self) -> None:
+        pending: dict[str, datetime] = {}
+        while not self._stop.is_set():
+            try:
+                group, when = self._report_q.get(timeout=0.5)
+                pending[group] = when
+            except queue.Empty:
+                pass
+            if not pending:
+                continue
+            time.sleep(0.15)
+            items = list(pending.items())
+            pending.clear()
+            for group, when in items:
+                try:
+                    self._write_excel(group, when, final=False)
+                except Exception:
+                    _LOG.exception("excel write failed for %s", group)
+
+    def _write_excel(self, group_name: str, when: datetime, final: bool) -> Optional[str]:
+        local = when.astimezone(self.cfg.tz)
+        start, end = month_bounds(local.year, local.month, self.cfg.tz)
+        signals = self.db.signals_in_range(group_name, start, end)
+        trades = self.db.trades_in_range(group_name, start, end)
+        path = self.reporter.write_month(
+            group_name, local.year, local.month, signals, trades, final=final
+        )
+        return str(path)
+
+    def write_month_file(self, group_name: str, year: int, month: int, final: bool) -> str:
+        start, end = month_bounds(year, month, self.cfg.tz)
+        signals = self.db.signals_in_range(group_name, start, end)
+        trades = self.db.trades_in_range(group_name, start, end)
+        path = self.reporter.write_month(group_name, year, month, signals, trades, final=final)
+        return str(path)
+
+    def _scheduler_tick(self) -> None:
+        now = utcnow().astimezone(self.cfg.tz)
+        self._maybe_monthly(now)
+        self._maybe_daily(now)
+
+    def _maybe_monthly(self, now: datetime) -> None:
+        if now.month == 1:
+            year, month = now.year - 1, 12
+        else:
+            year, month = now.year, now.month - 1
+        key = f"monthly_sent_{year:04d}-{month:02d}"
+        if self.db.get_meta(key):
+            return
+        start, end = month_bounds(year, month, self.cfg.tz)
+        has_data = False
+        for group in self.cfg.groups:
+            if self.db.signals_in_range(group.name, start, end):
+                has_data = True
+                break
+        if not has_data and now.day != 1:
+            return
+        paths = []
+        for group in self.cfg.groups:
+            path = self.write_month_file(group.name, year, month, final=True)
+            paths.append(path)
+            if self.cfg.monthly_telegram:
+                self.alert(
+                    f"דוח חודשי {year:04d}-{month:02d} לקבוצה {group.name}",
+                    path,
+                )
+        emailed = self.send_monthly_email(year, month, paths)
+        if not emailed and not self.cfg.monthly_telegram:
+            # אין ערוץ יציאה פעיל — לפחות שיהיה עקבות בלוג ובטלגרם.
+            _LOG.warning("Monthly report written to disk but not delivered anywhere")
+            self.alert(
+                f"דוח חודשי {year:04d}-{month:02d} נשמר בשרת, אבל שליחת המייל נכשלה.",
+                None,
+            )
+        self.db.set_meta(key, iso_now())
+        _LOG.info("Monthly reports sent for %s-%s", year, month)
+
+    def send_monthly_email(self, year: int, month: int, paths: list[str]) -> bool:
+        """מייל אחד לחודש עם קובץ אקסל לכל קבוצה, במקום הצפה בטלגרם."""
+        if not self.cfg.email_monthly or not self.mailer.enabled:
+            return False
+        start, end = month_bounds(year, month, self.cfg.tz)
+        lines = [f"דוח חודשי {year:04d}-{month:02d}", ""]
+        for group in self.cfg.groups:
+            signals = self.db.signals_in_range(group.name, start, end)
+            trades = self.db.trades_in_range(group.name, start, end)
+            closed = [t for t in trades if t.status == TradeStatus.CLOSED.value]
+            profit = round(sum(t.profit or 0.0 for t in closed), 2)
+            wins = len([t for t in closed if (t.profit or 0.0) > 0])
+            lines.append(
+                f"{group.name}: {len(signals)} איתותים, {len(trades)} עסקאות, "
+                f"{len(closed)} סגורות, {wins} ברווח, סה\"כ {profit}"
+            )
+        lines += ["", "הפירוט המלא והסטטיסטיקה נמצאים בקבצים המצורפים."]
+        return self.mailer.send(
+            subject=f"דוח חודשי {year:04d}-{month:02d} — gold-signal-bot",
+            body="\n".join(lines),
+            attachments=[Path(p) for p in paths],
+        )
+
+    def _maybe_daily(self, now: datetime) -> None:
+        if not self.cfg.daily_digest_enabled:
+            return
+        if now.hour != self.cfg.daily_digest_hour or now.minute < self.cfg.daily_digest_minute:
+            return
+        key = f"daily_sent_{now.strftime('%Y-%m-%d')}"
+        if self.db.get_meta(key):
+            return
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        lines = [f"סיכום יומי {now.strftime('%Y-%m-%d')}"]
+        for group in self.cfg.groups:
+            trades = self.db.trades_in_range(group.name, start, end)
+            closed = [t for t in trades if t.status == "closed"]
+            profit = round(sum(t.profit or 0.0 for t in closed), 2)
+            lines.append(f"{group.name}: {len(trades)} עסקאות, {len(closed)} סגורות, P/L {profit}")
+            path = self._write_excel(group.name, now, final=False)
+            if path and self.cfg.daily_digest_files:
+                self.alert(f"קובץ אקסל שוטף — {group.name}", path)
+        self.alert("\n".join(lines), None)
+        self.db.set_meta(key, iso_now())
+
+
+def iso_now() -> str:
+    return utcnow().isoformat()
+
+
+def select_tradable_tps(
+    parsed: ParsedSignal,
+    skip_first: int,
+    take_farthest: int,
+) -> list[tuple[int, float]]:
+    """מדלג על שורות קרובות ואז בוחר את ה-TP הרחוקים ביותר מהאזור."""
+    indexed = [
+        (index, price)
+        for index, price in enumerate(parsed.tps, start=1)
+        if index > skip_first
+    ]
+    if take_farthest <= 0 or len(indexed) <= take_farthest:
+        return indexed
+    mid = (parsed.zone_low + parsed.zone_high) / 2.0
+    def _distance(item: tuple[int, float]) -> float:
+        _index, price = item
+        return (price - mid) if parsed.side is Side.BUY else (mid - price)
+    ranked = sorted(indexed, key=lambda item: (_distance(item), item[0]), reverse=True)
+    chosen = ranked[:take_farthest]
+    chosen.sort(key=lambda item: item[0])
+    return chosen
+
+
+def select_breakeven_trigger(
+    tradable: list[tuple[int, float]],
+    breakeven_after_tp: int,
+) -> Optional[tuple[int, float]]:
+    """ה-TP שצריך להיסגר/להיגע לפני קידום סטופים לכניסה.
+
+    אם השורה המבוקשת נפתחה — היא הטריגר. אם דולגה, הטריגר הוא ה-TP
+    הפתוח הקרוב ביותר שאחריה (למשל skip 2 + farthest 3 + BE 3 → TP4).
+    """
+    if not tradable or breakeven_after_tp < 1:
+        return None
+    exact = next((item for item in tradable if item[0] == breakeven_after_tp), None)
+    if exact is not None:
+        return exact
+    farther = [item for item in tradable if item[0] > breakeven_after_tp]
+    if not farther:
+        return None
+    return min(farther, key=lambda item: item[0])
+
+
+def _ea_file_candidates(filename: str, common_files_dir: str, extra_dirs: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for folder in extra_dirs:
+        if folder:
+            paths.append(Path(folder) / filename)
+    if common_files_dir:
+        paths.append(Path(common_files_dir) / filename)
+    paths.append(
+        Path.home()
+        / "AppData"
+        / "Roaming"
+        / "MetaQuotes"
+        / "Terminal"
+        / "Common"
+        / "Files"
+        / filename
+    )
+    return paths
+
+
+def _read_chart_lot(common_files_dir: str, extra_dirs: Optional[list[str]] = None) -> Optional[float]:
+    """קורא לוט גלובלי ישן מ-gs_lot.txt. אם יש gs_lots.txt — לא משתמשים בזה."""
+    seen: set[str] = set()
+    for path in _ea_file_candidates("gs_lot.txt", common_files_dir, extra_dirs or []):
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not path.exists():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[0]
+            value = float(raw.split("|")[-1] if "|" in raw else raw)
+        except (OSError, ValueError, IndexError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _read_chart_group_lots(
+    common_files_dir: str, extra_dirs: list[str]
+) -> Optional[dict[str, float]]:
+    """לוט לכל קבוצה מחלון Inputs (gs_lots.txt)."""
+    seen: set[str] = set()
+    for path in _ea_file_candidates("gs_lots.txt", common_files_dir, extra_dirs):
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        parsed: dict[str, float] = {}
+        for line in lines:
+            if "=" not in line:
+                continue
+            name, raw = line.split("=", 1)
+            try:
+                value = float(raw.strip())
+            except ValueError:
+                continue
+            if name.strip() and value > 0:
+                parsed[name.strip()] = value
+        if parsed:
+            return parsed
+    return None
+
+
+def _parse_bool_flag(raw: str) -> Optional[bool]:
+    token = raw.strip().lower()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _read_chart_groups(common_files_dir: str, extra_dirs: list[str]) -> Optional[dict[str, bool]]:
+    """קורא אילו קבוצות להאזין מחלון Inputs של GoldSignalBridge (gs_groups.txt)."""
+    seen: set[str] = set()
+    for path in _ea_file_candidates("gs_groups.txt", common_files_dir, extra_dirs):
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        parsed: dict[str, bool] = {}
+        for line in lines:
+            if "=" not in line:
+                continue
+            name, raw = line.split("=", 1)
+            flag = _parse_bool_flag(raw)
+            if name.strip() and flag is not None:
+                parsed[name.strip()] = flag
+        if parsed:
+            return parsed
+    return None
+
+
+def _parse_trade_comment(comment: str) -> tuple[Optional[str], Optional[int]]:
+    """הערת העסקה נכתבת כ-GS|<group>|T<index> ומאפשרת לשחזר שיוך אחרי קריסה."""
+    if not comment:
+        return None, None
+    parts = str(comment).split("|")
+    if len(parts) < 3 or parts[0] != "GS":
+        return None, None
+    group = parts[1].strip() or None
+    index = None
+    token = parts[2].strip().upper()
+    if token.startswith("T") and token[1:].isdigit():
+        index = int(token[1:])
+    return group, index
+
+
+def _signal_id(item: IncomingSignal) -> str:
+    ts = item.received_at.astimezone().strftime("%Y%m%d-%H%M%S")
+    return f"{ts}-{abs(item.chat_id) % 1000000}-{item.telegram_msg_id}"
+
+
+def _new_signal(
+    signal_id: str, item: IncomingSignal, symbol: str, status: str, reason: str
+) -> SignalRecord:
+    return SignalRecord(
+        id=signal_id,
+        group_name=item.group.name,
+        chat_id=item.chat_id,
+        telegram_msg_id=item.telegram_msg_id,
+        received_at=item.received_at,
+        symbol=symbol,
+        side=item.parsed.side.value,
+        zone_low=item.parsed.zone_low,
+        zone_high=item.parsed.zone_high,
+        sl=item.parsed.sl,
+        raw_text=item.raw_text,
+        status=status,
+        skipped_reason=reason,
+        tps=item.parsed.tps,
+        username=item.group.username,
+    )

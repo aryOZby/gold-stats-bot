@@ -1,0 +1,99 @@
+timezone: Asia/Jerusalem
+dry_run: false
+
+telegram:
+  session_name: gold_stats_bot
+  groups:
+    - name: group_a
+      chat_id: -1002001216034
+      lot: 0.01
+      magic: 260908
+      skip_first_tps: 2
+      take_farthest_tps: 3
+      breakeven_after_tp: 3
+    - name: TechnicalPips6273
+      username: TechnicalPips6273
+      chat_id: -1001569906975
+      lot: 0.01
+      magic: 260909
+      skip_first_tps: 2
+      take_farthest_tps: 3
+      breakeven_after_tp: 3
+    - name: profit_kings
+      username: profitkingscalper_007
+      chat_id: -1002984909577
+      lot: 0.01
+      magic: 260910
+      skip_first_tps: 0
+      take_farthest_tps: 3
+      breakeven_after_tp: 1
+  admin_chat_id: 167570482
+
+trading:
+  # מתג ראשי. false = ממשיך להאזין ולתעד באקסל, אבל לא פותח פוזיציות.
+  # אפשר לשנות תוך כדי ריצה — הבוט קולט את זה תוך כ-5 שניות.
+  enabled: true
+  # ריק = תמיד גרף הזהב הפתוח ב-MT5. מה שכתוב בטלגרם (XAUUSD / GOLD / …) לא משנה.
+  symbol_override: ""
+  # 0 = בלי הגבלה. שתי קבוצות (ואיתותים נוספים) יכולות לרוץ במקביל.
+  # התיעוד נשאר נפרד לכל קבוצה.
+  max_concurrent_signals: 0
+  # מדלגים על שתי שורות ה-TP הראשונות (קרובות מדי).
+  # המספור נשאר לפי מספר השורה במקור, כך ש-TP3 נשאר TP3 בדוחות.
+  skip_first_tps: 2
+  # מבין השורות שנשארו — רק 3 ה-TP הכי רחוקים מהכניסה. 0 = בלי הגבלה.
+  take_farthest_tps: 3
+  # קידום SL לכניסה רק אחרי שה-TP הזה נפתח ונגיע אליו בפועל.
+  # אם השורה דולגה (כמו TP3 אחרי skip 2), מחכים ל-TP הבא שנפתח (TP4).
+  # ה-TP עצמו נשאר במחירו — מקדמים רק סטופים של רגליים רחוקות יותר.
+  breakeven_after_tp: 3
+  safety_delay_seconds: 5
+  safety_pips: 50
+  # שומר בלתי תלוי באסטרטגיה: כל כמה שניות לסרוק פוזיציות ולכפות SL/TP.
+  guard_interval_seconds: 5
+  pip_size: 0.1
+  magic_number: 260908
+  deviation: 30
+  order_retries: 1
+
+# Risk controls — all off by default, so behaviour matches previous versions.
+# Hot-reloaded like the lot size: edit and save, applied within ~5 seconds.
+risk:
+  # fixed = use each group's `lot`. risk_percent = size every signal from balance and SL distance.
+  lot_mode: fixed
+  # % of balance lost if SL is hit, split evenly across the signal's TP legs.
+  risk_percent: 1.0
+  min_lot: 0.01
+  max_lot: 1.0
+  lot_step: 0.01
+  # $ per 1.0 price move per lot, used only if the broker can't report it (XAUUSD = 100).
+  contract_value: 100
+  # Reject signals with SL/TP on the wrong side, or when price is already past the SL.
+  sanity_checks: false
+  # 0 = no limit. Reject signals whose SL is farther than this many pips from entry.
+  max_sl_pips: 0
+  # Stop opening NEW signals after today's realised loss reaches this amount / percent.
+  # 0 = off. Open positions are never closed by this rule.
+  daily_loss_limit: 0
+  daily_loss_limit_percent: 0
+
+broker:
+  type: mt5_native
+  common_files_dir: ""
+
+excel:
+  output_dir: reports
+  # הדוח החודשי (01 לחודש) נשלח במייל. ההגדרות ב-.env
+  email_monthly: true
+  # true = לשלוח את קבצי החודש גם לטלגרם. ברירת מחדל: מייל בלבד.
+  monthly_telegram: false
+  # סיכום יומי קצר לטלגרם ב-23:55
+  daily_digest: true
+  # true = לצרף לסיכום היומי גם קבצי אקסל. ברירת מחדל: טקסט בלבד.
+  daily_digest_files: false
+  daily_digest_hour: 23
+  daily_digest_minute: 55
+
+paths:
+  data_dir: data
+  logs_dir: logs
