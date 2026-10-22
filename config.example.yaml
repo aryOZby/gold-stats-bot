@@ -27,6 +27,9 @@ telegram:
       skip_first_tps: 0
       take_farthest_tps: 3
       breakeven_after_tp: 1
+      # כניסה בלימיט לפי המספר הראשון בשורה, וכמה איתותים במקביל.
+      limit_entry: true
+      allow_concurrent: true
   admin_chat_id: 167570482
 
 trading:
