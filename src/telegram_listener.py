@@ -33,23 +33,41 @@ class TelegramService:
         await self.client.start(phone=self.cfg.telegram_phone or None)
         me = await self.client.get_me()
         _LOG.info("Telegram signed in as %s id=%s", getattr(me, "username", None) or me.id, me.id)
-        await self._resolve_usernames()
-        self.client.add_event_handler(self._on_message, events.NewMessage())
+        await self._subscribe_groups()
+        targets = [g.chat_id for g in self.cfg.groups if g.chat_id]
+        if targets:
+            self.client.add_event_handler(
+                self._on_message, events.NewMessage(chats=targets)
+            )
+            _LOG.info("Listening only to %s", describe_groups(self.cfg.groups))
+        else:
+            self.client.add_event_handler(self._on_message, events.NewMessage())
+            _LOG.warning("No group chat_id resolved — listening to all chats")
         asyncio.create_task(self._drain_alerts())
 
-    async def _resolve_usernames(self) -> None:
+    async def _subscribe_groups(self) -> None:
+        """סשן חדש חייב 'לפתוח' את הערוץ פעם אחת, אחרת get_entity מצליח אבל אין עדכונים."""
         for group in self.cfg.groups:
-            if not group.username:
+            target = group.chat_id or group.username
+            if not target:
+                _LOG.warning("חסר chat_id/username לקבוצה %s", group.name)
                 continue
             try:
-                entity = await self.client.get_entity(group.username)
+                entity = await self.client.get_entity(target)
                 group.chat_id = int(get_peer_id(entity))
-                title = getattr(entity, "title", None) or getattr(entity, "username", group.username)
-                _LOG.info("Resolved @%s (%s) -> chat_id=%s", group.username, title, group.chat_id)
+                title = getattr(entity, "title", None) or getattr(entity, "username", group.name)
+                await self.client.get_messages(entity, limit=1)
+                _LOG.info(
+                    "Subscribed %s (%s) chat_id=%s",
+                    group.name,
+                    title,
+                    group.chat_id,
+                )
             except Exception:
                 _LOG.exception(
-                    "לא הצלחתי לפתור את @%s — ודא שהחשבון חבר/מנוי בקבוצה או בערוץ",
-                    group.username,
+                    "לא הצלחתי להירשם ל-%s (%s) — ודא שהחשבון חבר/מנוי בערוץ",
+                    group.name,
+                    target,
                 )
 
     async def run_until_disconnected(self) -> None:
